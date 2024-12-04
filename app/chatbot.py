@@ -1,14 +1,10 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
-import os
 import groq
 from youtube_transcript_api import YouTubeTranscriptApi
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores.faiss import FAISS
-from langchain.schema import Document
+from typing import List, Dict
 import re
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 class YouTubeChatbot:
     def __init__(self, api_key: str):
@@ -16,8 +12,9 @@ class YouTubeChatbot:
             raise ValueError("GROQ_API_KEY is required")
         self.client = groq.Groq(api_key=api_key)
         self.chat_history = []
-        self.db = None
-        self.embeddings = HuggingFaceEmbeddings()
+        self.transcript_chunks = []
+        self.vectorizer = TfidfVectorizer(stop_words='english')
+        self.tfidf_matrix = None
 
     def extract_video_id(self, url: str) -> str:
         """Extract video ID from YouTube URL."""
@@ -34,8 +31,29 @@ class YouTubeChatbot:
                 return match.group(1)
         return None
 
+    def chunk_text(self, text: str, chunk_size: int = 1000) -> List[str]:
+        """Split text into chunks of approximately equal size."""
+        words = text.split()
+        chunks = []
+        current_chunk = []
+        current_size = 0
+
+        for word in words:
+            current_size += len(word) + 1  # +1 for space
+            if current_size > chunk_size:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [word]
+                current_size = len(word)
+            else:
+                current_chunk.append(word)
+
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+
+        return chunks
+
     def process_url(self, url: str) -> str:
-        """Process YouTube URL and create vector store."""
+        """Process YouTube URL and create TF-IDF vectors."""
         try:
             # Extract video ID
             video_id = self.extract_video_id(url)
@@ -44,41 +62,37 @@ class YouTubeChatbot:
 
             # Get transcript
             transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-
-            # Combine transcript text
             full_transcript = " ".join([entry['text'] for entry in transcript_list])
 
-            # Create document
-            doc = Document(
-                page_content=full_transcript,
-                metadata={"video_id": video_id, "source": url}
-            )
+            # Split into chunks
+            self.transcript_chunks = self.chunk_text(full_transcript)
+            
+            # Create TF-IDF matrix
+            self.tfidf_matrix = self.vectorizer.fit_transform(self.transcript_chunks)
 
-            # Split text into chunks
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=100
-            )
-            texts = text_splitter.split_documents([doc])
-
-            # Create vector store
-            self.db = FAISS.from_documents(texts, self.embeddings)
-
-            return f"✅ Video transcript processed successfully!"
+            return "✅ Video transcript processed successfully!"
         except Exception as e:
             return f"❌ Error processing video: {str(e)}"
 
-    def get_relevant_context(self, query: str) -> str:
-        """Retrieve relevant context from the vector store."""
-        if not self.db:
+    def get_relevant_context(self, query: str, k: int = 3) -> str:
+        """Retrieve relevant context using TF-IDF similarity."""
+        if not self.tfidf_matrix or not self.transcript_chunks:
             return ""
 
-        docs = self.db.similarity_search(query, k=3)
-        return "\n".join([doc.page_content for doc in docs])
+        # Transform query using the same vectorizer
+        query_vector = self.vectorizer.transform([query])
+
+        # Calculate similarities
+        similarities = cosine_similarity(query_vector, self.tfidf_matrix)[0]
+
+        # Get top k chunks
+        top_k_indices = np.argsort(similarities)[-k:][::-1]
+        
+        return "\n".join([self.transcript_chunks[i] for i in top_k_indices])
 
     def chat(self, message: str) -> str:
         """Process a chat message and return the response."""
-        if not self.db:
+        if not self.tfidf_matrix or not self.transcript_chunks:
             return "⚠️ Please process a YouTube URL first before chatting."
 
         try:
@@ -90,26 +104,24 @@ class YouTubeChatbot:
                 {
                     "role": "system",
                     "content": """You are a specialized assistant that ONLY discusses the content from the provided YouTube video transcript.
-
                     IMPORTANT RULES:
                     1. ONLY answer questions based on the exact information provided in the video transcript context.
                     2. If the question cannot be answered using ONLY the provided transcript context, respond with: "I cannot answer this question as it's not covered in the video content."
                     3. Do not use any external knowledge or make assumptions beyond what's explicitly stated in the transcript.
                     4. If the question is about the video but the relevant information isn't in the current context, say: "While this question is about the video, I don't have access to this specific part of the content in my current context."
                     5. For any off-topic questions not related to the video, respond with: "I can only answer questions about the content of this specific video. Please ask something related to the video."
-
-                    Remember: You are ONLY knowledgeable about the content provided in the transcript context. Do not provide any information beyond this scope."""
+                    """
                 }
             ]
 
-            # Add chat history
-            for msg in self.chat_history[-4:]:  # Keep last 4 messages for context window
+            # Add chat history (last 4 messages)
+            for msg in self.chat_history[-4:]:
                 messages.append(msg)
 
             # Add context and current message
             messages.append({
                 "role": "user",
-                "content": f"""Context from video transcript:\n{context}\n\nUser question: {message}"""
+                "content": f"Context from video transcript:\n{context}\n\nUser question: {message}"
             })
 
             # Get response from Groq
@@ -130,43 +142,3 @@ class YouTubeChatbot:
             return response
         except Exception as e:
             return f"❌ Error processing message: {str(e)}"
-
-app = FastAPI(title="YouTube Chat API")
-
-# Initialize chatbot with environment variable
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-chatbot = YouTubeChatbot(GROQ_API_KEY)
-
-class ProcessVideoRequest(BaseModel):
-    url: str
-
-class ChatRequest(BaseModel):
-    message: str
-
-class ChatResponse(BaseModel):
-    response: str
-
-@app.post("/process-video")
-async def process_video(request: ProcessVideoRequest):
-    try:
-        result = chatbot.process_url(request.url)
-        if result.startswith("❌"):
-            raise HTTPException(status_code=400, detail=result)
-        return {"status": "success", "message": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    try:
-        response = chatbot.chat(request.message)
-        if response.startswith("⚠️"):
-            raise HTTPException(status_code=400, detail=response)
-        return ChatResponse(response=response)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# For local development
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
